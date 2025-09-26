@@ -22,6 +22,7 @@ from traiNNer.archs import build_network
 from traiNNer.archs.arch_info import ARCHS_WITHOUT_FP16
 from traiNNer.data.base_dataset import BaseDataset
 from traiNNer.losses import build_loss
+from traiNNer.losses.r3gan_loss import R3GANLoss
 from traiNNer.metrics import calculate_metric
 from traiNNer.models.base_model import BaseModel
 from traiNNer.utils import get_root_logger, imwrite, tensor2img
@@ -269,7 +270,7 @@ class SRModel(BaseModel):
             assert "loss_weight" in loss, f"{loss['type']} must define loss_weight"
             if float(loss["loss_weight"]) != 0:
                 label = loss_type_to_label(loss["type"])
-                if label == "l_g_gan":
+                if label in {"l_g_gan", "l_g_r3gan"}:
                     self.has_gan = True
                 self.losses[label] = build_loss(loss).to(
                     self.device,
@@ -419,10 +420,21 @@ class SRModel(BaseModel):
                                 )
                         target = lq_target
 
-                    if label == "l_g_gan":
+                    if label in {"l_g_gan", "l_g_r3gan"}:
                         assert self.net_d is not None
-                        fake_g_pred = self.net_d(self.output)
-                        l_g_loss = loss(fake_g_pred, True, is_disc=False)
+                        if isinstance(loss, R3GANLoss):
+                            assert self.gt is not None
+                            l_g_loss, r3gan_logs = loss.generator_forward(
+                                self.net_d,
+                                self.output,
+                                self.gt,
+                            )
+                            loss_dict["relativistic_logits_g"] = (
+                                r3gan_logs["relativistic_logits"].mean()
+                            )
+                        else:
+                            fake_g_pred = self.net_d(self.output)
+                            l_g_loss = loss(fake_g_pred, True, is_disc=False)
 
                         if self.adaptive_d:
                             l_g_gan_ema = (
@@ -505,6 +517,8 @@ class SRModel(BaseModel):
                     assert isinstance(self.output, Tensor)
 
         cri_gan = self.losses.get("l_g_gan")
+        if cri_gan is None:
+            cri_gan = self.losses.get("l_g_r3gan")
 
         if (
             self.net_d is not None
@@ -521,18 +535,41 @@ class SRModel(BaseModel):
                 dtype=self.amp_dtype,
                 enabled=self.use_amp,
             ):
-                # real
-                real_d_pred = self.net_d(self.gt)
-                l_d_real = cri_gan(real_d_pred, True, is_disc=True)
-                loss_dict["l_d_real"] = l_d_real
-                loss_dict["out_d_real"] = torch.mean(real_d_pred.detach())
-                # fake
-                fake_d_pred = self.net_d(self.output.detach())
-                l_d_fake = cri_gan(fake_d_pred, False, is_disc=True)
-                loss_dict["l_d_fake"] = l_d_fake
-                loss_dict["out_d_fake"] = torch.mean(fake_d_pred.detach())
+                if isinstance(cri_gan, R3GANLoss):
+                    assert self.gt is not None
+                    r3gan_stats = cri_gan.discriminator_forward(
+                        self.net_d,
+                        self.gt,
+                        self.output.detach(),
+                    )
+                    l_d_total = r3gan_stats["total_loss"]
+                    loss_dict["l_d_total"] = l_d_total
+                    loss_dict["l_d_adv"] = r3gan_stats["adversarial_loss"]
+                    loss_dict["l_d_r1"] = r3gan_stats["r1_contrib"]
+                    loss_dict["l_d_r2"] = r3gan_stats["r2_contrib"]
+                    loss_dict["l_d_real"] = r3gan_stats["adversarial_loss"]
+                    loss_dict["l_d_fake"] = (
+                        r3gan_stats["r1_contrib"] + r3gan_stats["r2_contrib"]
+                    )
+                    loss_dict["out_d_real"] = torch.mean(
+                        r3gan_stats["real_logits"]
+                    )
+                    loss_dict["out_d_fake"] = torch.mean(
+                        r3gan_stats["fake_logits"]
+                    )
+                else:
+                    real_d_pred = self.net_d(self.gt)
+                    l_d_real = cri_gan(real_d_pred, True, is_disc=True)
+                    loss_dict["l_d_real"] = l_d_real
+                    loss_dict["out_d_real"] = torch.mean(real_d_pred.detach())
+                    fake_d_pred = self.net_d(self.output.detach())
+                    l_d_fake = cri_gan(fake_d_pred, False, is_disc=True)
+                    loss_dict["l_d_fake"] = l_d_fake
+                    loss_dict["out_d_fake"] = torch.mean(fake_d_pred.detach())
+                    l_d_total = l_d_real + l_d_fake
+                    loss_dict["l_d_total"] = l_d_total
 
-            self.scaler_d.scale((l_d_real + l_d_fake) / self.accum_iters).backward()
+            self.scaler_d.scale(l_d_total / self.accum_iters).backward()
 
             if apply_gradient:
                 self.scaler_d.unscale_(self.optimizer_d)
