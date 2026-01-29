@@ -100,7 +100,7 @@ train:
   # https://trainner-redux.readthedocs.io/en/latest/loss_reference.html
   losses:
     # Charbonnier loss
-    - type: CharbonnierLoss
+    - type: l1loss
       loss_weight: 1.0
 
 ##############################################################################################
@@ -108,7 +108,7 @@ train:
 # https://trainner-redux.readthedocs.io/en/latest/config_reference.html#validation-options-val
 ##############################################################################################
 val:
-  val_enabled: false  # Whether to enable validations. If disabled, all validation settings below are ignored.
+  val_enabled: true  # Whether to enable validations. If disabled, all validation settings below are ignored.
   val_freq: 5000  # How often to run validations, in iterations.
   save_img: true  # Whether to save the validation images during validation, in the experiments/<name>/visualization folder.
   tile_size: 0  # Tile size of input, reduce VRAM usage but slower inference. 0 to disable.
