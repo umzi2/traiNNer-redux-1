@@ -233,14 +233,14 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
-        self.scale = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.offset = nn.Parameter(torch.zeros(1, dim, 1, 1))
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.offset = nn.Parameter(torch.zeros(dim))
         self.rms = dim**-0.5
 
     def forward(self, x: Tensor) -> Tensor:
         norm_x = x.norm(2, dim=1, keepdim=True).mul(self.rms).add(self.eps)
         x = x / norm_x
-        return x.mul(self.scale).add(self.offset)
+        return x.mul(self.scale[:, None, None]).add(self.offset[:, None, None])
 
 
 class GatedCNNBlock(nn.Module):
