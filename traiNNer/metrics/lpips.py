@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from traiNNer.archs.lpips_arch import LPIPS
+from traiNNer.losses.basic_loss import L1Loss
 from traiNNer.utils.img_util import img2batchedtensor
 from traiNNer.utils.registry import METRIC_REGISTRY
 
@@ -21,7 +21,7 @@ def calculate_lpips(
         f"Image shapes are different: {img.shape}, {img2.shape}."
     )
 
-    loss = LPIPS(net=net).to(device)
+    loss = L1Loss().to(device)
     loss.eval()
 
     with torch.inference_mode():
