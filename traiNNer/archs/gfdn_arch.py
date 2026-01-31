@@ -181,6 +181,76 @@ class ConvNXC(nn.Module):
 
 
 class InceptionConv2d(nn.Module):
+    """Inception convolution with PLK-style inference (precomputed channel slices)"""
+
+    def __init__(
+        self,
+        in_channels: int,
+        square_kernel_size: int = 7,
+        band_kernel_size: int = 11,
+        branch_ratio: float = 0.25,
+        rep: bool = False,
+    ) -> None:
+        super().__init__()
+
+        gc = int(in_channels * branch_ratio)
+        self.gc = gc
+        self.id_channels = in_channels - 3 * gc
+
+        # 👉 заранее считаем границы каналов
+        c0 = self.id_channels
+        c1 = c0 + gc
+        c2 = c1 + gc
+        c3 = c2 + gc
+
+        self._slice_hw = (c0, c1)
+        self._slice_w = (c1, c2)
+        self._slice_h = (c2, c3)
+
+        self.conv_hw = (
+            ConvNXC(gc, gc, (square_kernel_size, square_kernel_size))
+            if rep
+            else nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size // 2)
+        )
+        self.conv_w = (
+            ConvNXC(gc, gc, (1, band_kernel_size))
+            if rep
+            else nn.Conv2d(
+                gc, gc, (1, band_kernel_size), padding=(0, band_kernel_size // 2)
+            )
+        )
+        self.conv_h = (
+            ConvNXC(gc, gc, (band_kernel_size, 1))
+            if rep
+            else nn.Conv2d(
+                gc, gc, (band_kernel_size, 1), padding=(band_kernel_size // 2, 0)
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            x_id = x[:, : self.id_channels]
+            x_hw = x[:, self._slice_hw[0] : self._slice_hw[1]]
+            x_w = x[:, self._slice_w[0] : self._slice_w[1]]
+            x_h = x[:, self._slice_h[0] : self._slice_h[1]]
+
+            return torch.cat(
+                (x_id, self.conv_hw(x_hw), self.conv_w(x_w), self.conv_h(x_h)),
+                dim=1,
+            )
+        else:
+            # 🚀 eval: inplace перезапись как в PLK
+            s0, s1 = self._slice_hw
+            s2, s3 = self._slice_w
+            s4, s5 = self._slice_h
+
+            x[:, s0:s1] = self.conv_hw(x[:, s0:s1])
+            x[:, s2:s3] = self.conv_w(x[:, s2:s3])
+            x[:, s4:s5] = self.conv_h(x[:, s4:s5])
+            return x
+
+
+class InceptionConv2dold(nn.Module):
     """Inception convolution"""
 
     def __init__(
@@ -265,9 +335,10 @@ class GatedCNNBlock(nn.Module):
             if rep
             else nn.Conv2d(dim, hidden * 2, 3, 1, 1)
         )
+        cd = int(dim)
         self.act = nn.SiLU()
-        self.split_indices = [hidden, hidden - dim, dim]
-        self.conv = InceptionConv2d(dim, square_kernel_size, band_kernel_size, rep=rep)
+        self.split_indices = [hidden, hidden - cd, cd]
+        self.conv = InceptionConv2d(cd, square_kernel_size, band_kernel_size, rep=rep)
         self.fc2 = (
             ConvNXC(hidden, dim, (1, 1)) if rep else nn.Conv2d(hidden, dim, 1, 1, 0)
         )
@@ -327,20 +398,20 @@ class GILSR(nn.Module):
         self.scale_norm = nn.Parameter(torch.ones(1, 3, 1, 1) / 6, requires_grad=True)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = (x - self.shift) / self.scale_norm
+        x = x.sub_(self.shift).div_(self.scale_norm)
         x = self.in_to_dim(x)
         x0 = self.block_0(x)
         x = self.conv_cat(torch.cat([x, self.block_n(x0), x0], dim=1))
         x = self.dim_to_scale(x)
-        x = (x * self.scale_norm) + self.shift
+        x = x.mul_(self.scale_norm).add_(self.shift)
         return x
 
 
 @ARCH_REGISTRY.register()
 def GILSR_s(
-    expansion_ratios: Sequence[float] = (1.5, 2, 1.5, 2),
-    square_kernel_size: int = 7,
-    band_kernel_size: int = 11,
+    expansion_ratios: Sequence[float] = (2, 1.25, 1.25, 1.25, 1.25, 2),
+    square_kernel_size: int = 11,
+    band_kernel_size: int = 17,
     **kwargs,
 ):
     return GILSR(
@@ -349,3 +420,67 @@ def GILSR_s(
         band_kernel_size=band_kernel_size,
         **kwargs,
     )
+
+
+if __name__ == "__main__":
+    import time
+
+    import torch
+
+    def benchmark_model(
+        model, input_size=(1, 3, 256, 256), device=None, runs=50, warmup=10
+    ):
+        """
+        Валидно измеряет скорость инференса и считает параметры модели.
+
+        :param model: torch.nn.Module
+        :param input_size: tuple, размер входного тензора (N, C, H, W)
+        :param device: 'cuda' или 'cpu'. Если None — выбирается автоматически
+        :param runs: количество замеров скорости
+        :param warmup: количество прогревочных прогонов (не учитываются в замере)
+        :return: словарь с метриками
+        """
+
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device).eval()
+
+        # Считаем параметры
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        dummy_input = torch.randn(input_size, device=device)
+
+        # Прогрев (важно для CUDA и TorchInductor)
+        with torch.no_grad():
+            for _ in range(warmup):
+                _ = model(dummy_input)
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+        # Замер времени
+        start_time = time.perf_counter()
+
+        with torch.no_grad():
+            for _ in range(runs):
+                _ = model(dummy_input)
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+        total_time = time.perf_counter() - start_time
+        avg_time = total_time / runs
+        fps = 1.0 / avg_time
+
+        return {
+            "device": device,
+            "input_size": input_size,
+            "total_params": total_params,
+            "trainable_params": trainable_params,
+            "avg_inference_time_sec": avg_time,
+            "fps": fps,
+        }
+
+    stats = benchmark_model(GILSR_s(), input_size=(1, 3, 2048, 2048))
+    for k, v in stats.items():
+        print(f"{k}: {v}")

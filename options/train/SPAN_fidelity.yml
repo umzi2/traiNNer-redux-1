@@ -26,11 +26,11 @@ datasets:
     type: pairedimagedataset
     # Path to the HR (high res) images in your training dataset. Specify one or multiple folders, separated by commas.
     dataroot_gt: [
-/run/media/umzi/H/ппп_е/ri/BHI_small
+/run/media/umzi/H/traiNNer-redux-12/datasets/DF2K-bicubic/hr_tiff
     ]
     # Path to the LR (low res) images in your training dataset. Specify one or multiple folders, separated by commas.
     dataroot_lq: [
-/run/media/umzi/H/ппп_е/ri/x4
+/run/media/umzi/H/traiNNer-redux-12/datasets/DF2K-bicubic/x4_tiff
     ]
     # meta_info: data/meta_info/dataset1.txt
 
@@ -61,14 +61,14 @@ datasets:
 #####################################################################
 # Generator model settings
 network_g:
-  type: GILSR_s
+  type: GILSR
 
 #########################################################################################
 # Pretrain and Resume Paths
 # https://trainner-redux.readthedocs.io/en/latest/config_reference.html#path-options-path
 #########################################################################################
 path:
-  # pretrain_network_g: experiments/pretrained_models/pretrain.pth
+#  pretrain_network_g: /run/media/umzi/H/traiNNer-redux-12/experiments/net_g_ema_175000.safetensors
   param_key_g: ~
   strict_load_g: true    # Disable strict loading to partially load a pretrain model with a different scale
   resume_state: ~
