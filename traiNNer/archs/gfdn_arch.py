@@ -1,12 +1,24 @@
-from collections.abc import Sequence
-from typing import Self
+import math
+from typing import Literal
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.nn.init import Tensor
+from einops import rearrange
+from torch import Tensor, nn
 
 from traiNNer.utils.registry import ARCH_REGISTRY
+
+SampleMods = Literal[
+    "conv",
+    "pixelshuffledirect",
+    "pixelshuffle",
+    "nearest+conv",
+    "dysample",
+    "transpose+conv",
+    "lda",
+    "pa_up",
+]
 
 
 def ICNR(tensor, initializer, upscale_factor=2, *args, **kwargs):
@@ -23,447 +35,753 @@ def ICNR(tensor, initializer, upscale_factor=2, *args, **kwargs):
     sub_kernel = initializer(sub_kernel, *args, **kwargs)
     return sub_kernel.repeat_interleave(upscale_factor_squared, dim=0)
 
+class DySample(nn.Module):
+    """Adapted from 'Learning to Upsample by Learning to Sample':
+    https://arxiv.org/abs/2308.15085
+    https://github.com/tiny-smart/dysample
+    """
 
-class ConvNXC(nn.Module):
     def __init__(
         self,
-        c_in: int,
-        c_out: int,
-        kernel_size: tuple[int, int] = (3, 3),
-        gain1: int = 2,
-        s: int = 1,
-        bias: bool = True,
+        in_channels: int = 64,
+        out_ch: int = 3,
+        scale: int = 2,
+        groups: int = 4,
+        end_convolution: bool = True,
+        end_kernel=1,
     ) -> None:
         super().__init__()
-        self.use_bias = bias
-        self.weight_concat = None
-        self.bias_concat = None
-        self.update_params_flag = False
-        self.stride = s
-        self.kernel_size = kernel_size
-        self.c_in = c_in
-        self.c_out = c_out
-        gain = gain1
 
-        self.sk = nn.Conv2d(
-            in_channels=c_in,
-            out_channels=c_out,
-            kernel_size=1,
-            padding=0,
-            stride=s,
-            bias=bias,
-        )
+        if in_channels <= groups or in_channels % groups != 0:
+            msg = "Incorrect in_channels and groups values."
+            raise ValueError(msg)
 
-        pad_h = (kernel_size[0] - 1) // 2
-        pad_w = (kernel_size[1] - 1) // 2
-        self.padding = (pad_h, pad_w)
-
-        self.conv = nn.Sequential(
-            nn.Conv2d(
-                in_channels=c_in,
-                out_channels=c_in * gain,
-                kernel_size=1,
-                padding=0,
-                bias=bias,
-            ),
-            nn.Conv2d(
-                in_channels=c_in * gain,
-                out_channels=c_out * gain,
-                kernel_size=kernel_size,
-                stride=s,
-                padding=0,
-                bias=bias,
-            ),
-            nn.Conv2d(
-                in_channels=c_out * gain,
-                out_channels=c_out,
-                kernel_size=1,
-                padding=0,
-                bias=bias,
-            ),
-        )
-        self.weight = nn.Parameter(
-            torch.zeros(c_out, c_in, kernel_size[0], kernel_size[1])
-        )
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(c_out))
-        else:
-            self.register_parameter("bias", None)
-
-        nn.init.trunc_normal_(self.sk.weight, std=0.02)
-
-    def update_params(self) -> None:
-        w1 = self.conv[0].weight.data.clone().detach()
-        w2 = self.conv[1].weight.data.clone().detach()
-        w3 = self.conv[2].weight.data.clone().detach()
-
-        kh, kw = self.kernel_size
-        pad_h = kh - 1
-        pad_w = kw - 1
-
-        w = (
-            F.conv2d(
-                w1.flip(2, 3).permute(1, 0, 2, 3),
-                w2,
-                padding=(pad_h, pad_w),
-                stride=1,
+        out_channels = 2 * groups * scale**2
+        self.scale = scale
+        self.groups = groups
+        self.end_convolution = end_convolution
+        if end_convolution:
+            self.end_conv = nn.Conv2d(
+                in_channels, out_ch, end_kernel, 1, end_kernel // 2
             )
-            .flip(2, 3)
-            .permute(1, 0, 2, 3)
+        self.offset = nn.Conv2d(in_channels, out_channels, 1)
+        self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        if self.training:
+            nn.init.trunc_normal_(self.offset.weight, std=0.02)
+            nn.init.constant_(self.scope.weight, val=0)
+
+        self.register_buffer("init_pos", self._init_pos())
+
+    def _init_pos(self) -> Tensor:
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        return (
+            torch.stack(torch.meshgrid([h, h], indexing="ij"))
+            .transpose(1, 2)
+            .repeat(1, self.groups, 1)
+            .reshape(1, -1, 1, 1)
         )
-
-        self.weight_concat = (
-            F.conv2d(
-                w.flip(2, 3).permute(1, 0, 2, 3),
-                w3,
-                padding=0,
-                stride=1,
-            )
-            .flip(2, 3)
-            .permute(1, 0, 2, 3)
-        )
-
-        sk_w = self.sk.weight.data.clone().detach()
-
-        if self.use_bias:
-            b1 = self.conv[0].bias.data.clone().detach()
-            b2 = self.conv[1].bias.data.clone().detach()
-            b3 = self.conv[2].bias.data.clone().detach()
-            b = (w2 * b1.reshape(1, -1, 1, 1)).sum((1, 2, 3)) + b2
-            self.bias_concat = (w3 * b.reshape(1, -1, 1, 1)).sum((1, 2, 3)) + b3
-            sk_b = self.sk.bias.data.clone().detach()
-
-        kh, kw = self.kernel_size
-        h_pixels_to_pad = (kh - 1) // 2
-        w_pixels_to_pad = (kw - 1) // 2
-
-        sk_w = F.pad(
-            sk_w,
-            [w_pixels_to_pad, w_pixels_to_pad, h_pixels_to_pad, h_pixels_to_pad],
-        )
-
-        self.weight_concat = self.weight_concat + sk_w
-        self.weight.data = self.weight_concat
-
-        if self.use_bias:
-            self.bias_concat = self.bias_concat + sk_b
-            self.bias.data = self.bias_concat
-
-    def train(self, mode: bool = True) -> Self:
-        super().train(mode)
-        if not mode:
-            self.update_params()
-        return self
-
-    def forward_train(self, x: torch.Tensor) -> torch.Tensor:
-        pad_h = (self.kernel_size[0] - 1) // 2
-        pad_w = (self.kernel_size[1] - 1) // 2
-        x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h), "constant", 0)
-        out = self.conv(x_pad) + self.sk(x)
-        return out
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.training:
-            # Вычисляем padding на основе kernel_size
-            pad_h = (self.kernel_size[0] - 1) // 2
-            pad_w = (self.kernel_size[1] - 1) // 2
-            x_pad = F.pad(x, (pad_w, pad_w, pad_h, pad_h), "constant", 0)
-            out = self.conv(x_pad) + self.sk(x)
-        else:
-            out = F.conv2d(
-                x,
-                self.weight,
-                self.bias if self.use_bias else None,
-                stride=self.stride,
-                padding=self.padding,
+        offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+        coords_h = torch.arange(H) + 0.5
+        coords_w = torch.arange(W) + 0.5
+
+        coords = (
+            torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
+            .transpose(1, 2)
+            .unsqueeze(1)
+            .unsqueeze(0)
+            .type(x.dtype)
+            .to(x.device, non_blocking=True)
+        )
+        normalizer = torch.tensor(
+            [W, H], dtype=x.dtype, device=x.device, pin_memory=True
+        ).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+
+        coords = (
+            F.pixel_shuffle(coords.reshape(B, -1, H, W), self.scale)
+            .view(B, 2, -1, self.scale * H, self.scale * W)
+            .permute(0, 2, 3, 4, 1)
+            .contiguous()
+            .flatten(0, 1)
+        )
+        output = F.grid_sample(
+            x.reshape(B * self.groups, -1, H, W),
+            coords,
+            mode="bilinear",
+            align_corners=False,
+            padding_mode="border",
+        ).view(B, -1, self.scale * H, self.scale * W)
+
+        if self.end_convolution:
+            output = self.end_conv(output)
+
+        return output
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int = 64, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+        self.dim = (dim,)
+
+    def forward(self, x):
+        if x.is_contiguous(memory_format=torch.channels_last):
+            return F.layer_norm(
+                x.permute(0, 2, 3, 1), self.dim, self.weight, self.bias, self.eps
+            ).permute(0, 3, 1, 2)
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+
+
+class LDA_AQU(nn.Module):
+    def __init__(
+        self,
+        in_channels=48,
+        reduction_factor=4,
+        nh=1,
+        scale_factor=2.0,
+        k_e=3,
+        k_u=3,
+        n_groups=2,
+        range_factor=11,
+        rpb=True,
+    ) -> None:
+        super().__init__()
+        self.k_u = k_u
+        self.num_head = nh
+        self.scale_factor = scale_factor
+        self.n_groups = n_groups
+        self.offset_range_factor = range_factor
+
+        self.attn_dim = in_channels // (reduction_factor * self.num_head)
+        self.scale = self.attn_dim**-0.5
+        self.rpb = rpb
+        self.hidden_dim = in_channels // reduction_factor
+        self.proj_q = nn.Conv2d(
+            in_channels, self.hidden_dim, kernel_size=1, stride=1, padding=0, bias=False
+        )
+
+        self.proj_k = nn.Conv2d(
+            in_channels, self.hidden_dim, kernel_size=1, stride=1, padding=0, bias=False
+        )
+
+        self.group_channel = in_channels // (reduction_factor * self.n_groups)
+        # print(self.group_channel)
+        self.conv_offset = nn.Sequential(
+            nn.Conv2d(
+                self.group_channel,
+                self.group_channel,
+                3,
+                1,
+                1,
+                groups=self.group_channel,
+                bias=False,
+            ),
+            LayerNorm(self.group_channel),
+            nn.SiLU(),
+            nn.Conv2d(self.group_channel, 2 * k_u**2, k_e, 1, k_e // 2),
+        )
+        print(2 * k_u**2)
+        self.layer_norm = LayerNorm(in_channels)
+
+        self.pad = int((self.k_u - 1) / 2)
+        base = np.arange(-self.pad, self.pad + 1).astype(np.float32)
+        base_y = np.repeat(base, self.k_u)
+        base_x = np.tile(base, self.k_u)
+        base_offset = np.stack([base_y, base_x], axis=1).flatten()
+        base_offset = torch.tensor(base_offset).view(1, -1, 1, 1)
+        self.register_buffer("base_offset", base_offset, persistent=False)
+
+        if self.rpb:
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros(
+                    1, self.num_head, 1, self.k_u**2, self.hidden_dim // self.num_head
+                )
             )
+            nn.init.trunc_normal_(self.relative_position_bias_table, std=0.02)
+
+    def init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform(m)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0)
+                nn.init.constant_(m.weight, 1.0)
+        nn.init.constant_(self.conv_offset[-1].weight, 0)
+        nn.init.constant_(self.conv_offset[-1].bias, 0)
+
+    def get_offset(self, offset, Hout, Wout):
+        B, _, _, _ = offset.shape
+        device = offset.device
+        row_indices = torch.arange(Hout, device=device)
+        col_indices = torch.arange(Wout, device=device)
+        row_indices, col_indices = torch.meshgrid(row_indices, col_indices)
+        index_tensor = torch.stack((row_indices, col_indices), dim=-1).view(
+            1, Hout, Wout, 2
+        )
+        offset = rearrange(
+            offset, "b (kh kw d) h w -> b kh h kw w d", kh=self.k_u, kw=self.k_u
+        )
+        offset = offset + index_tensor.view(1, 1, Hout, 1, Wout, 2)
+        offset = offset.contiguous().view(B, self.k_u * Hout, self.k_u * Wout, 2)
+
+        offset[..., 0] = 2 * offset[..., 0] / (Hout - 1) - 1
+        offset[..., 1] = 2 * offset[..., 1] / (Wout - 1) - 1
+        offset = offset.flip(-1)
+        return offset
+
+    def extract_feats(self, x, offset, ks=3):
+        out = nn.functional.grid_sample(
+            x, offset, mode="bilinear", padding_mode="zeros", align_corners=True
+        )
+        out = rearrange(out, "b c (ksh h) (ksw w) -> b (ksh ksw) c h w", ksh=ks, ksw=ks)
+        return out
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        out_H, out_W = int(H * self.scale_factor), int(W * self.scale_factor)
+        v = x
+        x = self.layer_norm(x)
+        q = self.proj_q(x)
+        k = self.proj_k(x)
+
+        q = torch.nn.functional.interpolate(
+            q, (out_H, out_W), mode="bilinear", align_corners=True
+        )
+        q_off = q.view(B * self.n_groups, -1, out_H, out_W)
+        pred_offset = self.conv_offset(q_off)
+        offset = pred_offset.tanh().mul(self.offset_range_factor) + self.base_offset.to(
+            x.dtype
+        )
+
+        k = k.view(B * self.n_groups, self.hidden_dim // self.n_groups, H, W)
+        v = v.view(B * self.n_groups, C // self.n_groups, H, W)
+        offset = self.get_offset(offset, out_H, out_W)
+        k = self.extract_feats(k, offset=offset)
+        v = self.extract_feats(v, offset=offset)
+
+        q = rearrange(q, "b (nh c) h w -> b nh (h w) () c", nh=self.num_head)
+        k = rearrange(k, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        v = rearrange(v, "(b g) n c h w -> b (h w) n (g c)", g=self.n_groups)
+        k = rearrange(k, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
+        v = rearrange(v, "b n1 n (nh c) -> b nh n1 n c", nh=self.num_head)
+
+        if self.rpb:
+            k = k + self.relative_position_bias_table
+
+        q = q * self.scale
+        attn = q @ k.transpose(-1, -2)
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+
+        out = rearrange(out, "b nh (h w) t c -> b (nh c) (t h) w", h=out_H)
         return out
 
 
-class InceptionConv2d(nn.Module):
-    """Inception convolution with PLK-style inference (precomputed channel slices)"""
+class PA(nn.Module):
+    def __init__(self, dim) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(nn.Conv2d(dim, dim, 1), nn.Sigmoid())
 
+    def forward(self, x):
+        return x.mul(self.conv(x))
+
+
+class UniUpsampleV3(nn.Sequential):
     def __init__(
         self,
-        in_channels: int,
-        square_kernel_size: int = 7,
-        band_kernel_size: int = 11,
-        branch_ratio: float = 0.25,
-        rep: bool = False,
+        upsample: SampleMods = "pa_up",
+        scale: int = 2,
+        in_dim: int = 48,
+        out_dim: int = 3,
+        mid_dim: int = 48,
+        group: int = 4,  # Only DySample
+        dysample_end_kernel=1,  # needed only for compatibility with version 2
     ) -> None:
-        super().__init__()
+        m = []
 
-        gc = int(in_channels * branch_ratio)
-        self.gc = gc
-        self.id_channels = in_channels - 3 * gc
-
-        # 👉 заранее считаем границы каналов
-        c0 = self.id_channels
-        c1 = c0 + gc
-        c2 = c1 + gc
-        c3 = c2 + gc
-
-        self._slice_hw = (c0, c1)
-        self._slice_w = (c1, c2)
-        self._slice_h = (c2, c3)
-
-        self.conv_hw = (
-            ConvNXC(gc, gc, (square_kernel_size, square_kernel_size))
-            if rep
-            else nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size // 2)
-        )
-        self.conv_w = (
-            ConvNXC(gc, gc, (1, band_kernel_size))
-            if rep
-            else nn.Conv2d(
-                gc, gc, (1, band_kernel_size), padding=(0, band_kernel_size // 2)
+        if scale == 1 or upsample == "conv":
+            m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
+        elif upsample == "pixelshuffledirect":
+            m.extend(
+                [nn.Conv2d(in_dim, out_dim * scale**2, 3, 1, 1), nn.PixelShuffle(scale)]
             )
-        )
-        self.conv_h = (
-            ConvNXC(gc, gc, (band_kernel_size, 1))
-            if rep
-            else nn.Conv2d(
-                gc, gc, (band_kernel_size, 1), padding=(band_kernel_size // 2, 0)
+        elif upsample == "pixelshuffle":
+            m.extend([nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)])
+            if (scale & (scale - 1)) == 0:  # scale = 2^n
+                for _ in range(int(math.log2(scale))):
+                    m.extend(
+                        [nn.Conv2d(mid_dim, 4 * mid_dim, 3, 1, 1), nn.PixelShuffle(2)]
+                    )
+            elif scale == 3:
+                m.extend([nn.Conv2d(mid_dim, 9 * mid_dim, 3, 1, 1), nn.PixelShuffle(3)])
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
+            m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
+        elif upsample == "nearest+conv":
+            if (scale & (scale - 1)) == 0:
+                for _ in range(int(math.log2(scale))):
+                    m.extend(
+                        (
+                            nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                            nn.Upsample(scale_factor=2),
+                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        )
+                    )
+                m.extend(
+                    (
+                        nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                    )
+                )
+            elif scale == 3:
+                m.extend(
+                    (
+                        nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                        nn.Upsample(scale_factor=scale),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        nn.Conv2d(in_dim, in_dim, 3, 1, 1),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                    )
+                )
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
+            m.append(nn.Conv2d(in_dim, out_dim, 3, 1, 1))
+        elif upsample == "dysample":
+            if mid_dim != in_dim:
+                m.extend(
+                    [nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)]
+                )
+            m.append(
+                DySample(mid_dim, out_dim, scale, group, end_kernel=dysample_end_kernel)
             )
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            x_id = x[:, : self.id_channels]
-            x_hw = x[:, self._slice_hw[0] : self._slice_hw[1]]
-            x_w = x[:, self._slice_w[0] : self._slice_w[1]]
-            x_h = x[:, self._slice_h[0] : self._slice_h[1]]
-
-            return torch.cat(
-                (x_id, self.conv_hw(x_hw), self.conv_w(x_w), self.conv_h(x_h)),
-                dim=1,
-            )
+            # m.append(nn.Conv2d(mid_dim, out_dim, dysample_end_kernel, 1, dysample_end_kernel//2)) # kernel 1 causes chromatic artifacts
+        elif upsample == "transpose+conv":
+            if scale == 2:
+                m.append(nn.ConvTranspose2d(in_dim, out_dim, 4, 2, 1))
+            elif scale == 3:
+                m.append(nn.ConvTranspose2d(in_dim, out_dim, 3, 3, 0))
+            elif scale == 4:
+                m.extend(
+                    [
+                        nn.ConvTranspose2d(in_dim, in_dim, 4, 2, 1),
+                        nn.GELU(),
+                        nn.ConvTranspose2d(in_dim, out_dim, 4, 2, 1),
+                    ]
+                )
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2, 3, 4"
+                )
+            m.append(nn.Conv2d(out_dim, out_dim, 3, 1, 1))
+        elif upsample == "lda":
+            if mid_dim != in_dim:
+                m.extend(
+                    [nn.Conv2d(in_dim, mid_dim, 3, 1, 1), nn.LeakyReLU(inplace=True)]
+                )
+            m.append(LDA_AQU(mid_dim, scale_factor=scale))
+            m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
+        elif upsample == "pa_up":
+            if (scale & (scale - 1)) == 0:
+                for _ in range(int(math.log2(scale))):
+                    m.extend(
+                        [
+                            nn.Upsample(scale_factor=2),
+                            nn.Conv2d(in_dim, mid_dim, 3, 1, 1),
+                            PA(mid_dim),
+                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                            nn.Conv2d(mid_dim, mid_dim, 3, 1, 1),
+                            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        ]
+                    )
+                    in_dim = mid_dim
+            elif scale == 3:
+                m.extend(
+                    [
+                        nn.Upsample(scale_factor=3),
+                        nn.Conv2d(in_dim, mid_dim, 3, 1, 1),
+                        PA(mid_dim),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                        nn.Conv2d(mid_dim, mid_dim, 3, 1, 1),
+                        nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                    ]
+                )
+            else:
+                raise ValueError(
+                    f"scale {scale} is not supported. Supported scales: 2^n and 3."
+                )
+            m.append(nn.Conv2d(mid_dim, out_dim, 3, 1, 1))
         else:
-            # 🚀 eval: inplace перезапись как в PLK
-            s0, s1 = self._slice_hw
-            s2, s3 = self._slice_w
-            s4, s5 = self._slice_h
-
-            x[:, s0:s1] = self.conv_hw(x[:, s0:s1])
-            x[:, s2:s3] = self.conv_w(x[:, s2:s3])
-            x[:, s4:s5] = self.conv_h(x[:, s4:s5])
-            return x
-
-
-class InceptionConv2dold(nn.Module):
-    """Inception convolution"""
-
-    def __init__(
-        self,
-        in_channels: int,
-        square_kernel_size: int = 7,  # 11
-        band_kernel_size: int = 11,  # 17
-        branch_ratio: float = 0.25,  # 0.25
-        rep: bool = False,
-    ) -> None:
-        super().__init__()
-
-        gc = int(in_channels * branch_ratio)  # channel numbers of a convolution branch
-        self.conv_hw = (
-            ConvNXC(gc, gc, (square_kernel_size, square_kernel_size))
-            if rep
-            else nn.Conv2d(gc, gc, square_kernel_size, padding=square_kernel_size // 2)
-        )
-        self.conv_w = (
-            ConvNXC(gc, gc, (1, band_kernel_size))
-            if rep
-            else nn.Conv2d(
-                gc,
-                gc,
-                kernel_size=(1, band_kernel_size),
-                padding=(0, band_kernel_size // 2),
+            raise ValueError(
+                f"An invalid Upsample was selected. Please choose one of {SampleMods}"
             )
-        )
-        self.conv_h = (
-            ConvNXC(gc, gc, (band_kernel_size, 1))
-            if rep
-            else nn.Conv2d(
-                gc,
-                gc,
-                kernel_size=(band_kernel_size, 1),
-                padding=(band_kernel_size // 2, 0),
-            )
-        )
-        self.split_indexes = [in_channels - 3 * gc, gc, gc, gc]
+        super().__init__(*m)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x_id, x_hw, x_w, x_h = torch.split(x, self.split_indexes, dim=1)
-        return torch.cat(
-            (x_id, self.conv_hw(x_hw), self.conv_w(x_w), self.conv_h(x_h)),
-            dim=1,
+        self.register_buffer(
+            "MetaUpsample",
+            torch.tensor(
+                [
+                    3,  # Block version, if you change something, please number from the end so that you can distinguish between authorized changes and third parties
+                    list(SampleMods.__args__).index(upsample),  # UpSample method index
+                    scale,
+                    in_dim,
+                    out_dim,
+                    mid_dim,
+                    group,
+                ],
+                dtype=torch.uint8,
+            ),
         )
 
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
         self.offset = nn.Parameter(torch.zeros(dim))
-        self.rms = dim**-0.5
+        self.eps = nn.Parameter(torch.Tensor(torch.ones(1) * eps), requires_grad=False)
+        self.rms = nn.Parameter(
+            torch.Tensor(torch.ones(1) * (dim**-0.5)), requires_grad=False
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        norm_x = x.norm(2, dim=1, keepdim=True).mul(self.rms).add(self.eps)
-        x = x / norm_x
-        return x.mul(self.scale[:, None, None]).add(self.offset[:, None, None])
+        norm_x = torch.addcmul(self.eps, x.norm(2, dim=1, keepdim=True), self.rms)
+        return torch.addcmul(
+            self.offset[:, None, None], x.div(norm_x), self.scale[:, None, None]
+        )
+
+
+class CustomRFFT2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor):
+        y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
+        return torch.view_as_real(y)
+
+    @staticmethod
+    def symbolic(g, x: torch.Value):
+        axes_last = g.op("Constant", value_t=torch.tensor([4], dtype=torch.int64))
+        x_u = g.op("Unsqueeze", x, axes_last)
+        zero = g.op("Sub", x_u, x_u)
+        x_c = g.op("Concat", x_u, zero, axis_i=4)
+        shp = g.op("Shape", x)
+        iH = g.op("Constant", value_t=torch.tensor([2], dtype=torch.int64))
+        iW = g.op("Constant", value_t=torch.tensor([3], dtype=torch.int64))
+        nH = g.op("Gather", shp, iH, axis_i=0)
+        nW = g.op("Gather", shp, iW, axis_i=0)
+        Hf = g.op("Cast", nH, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        Wf = g.op("Cast", nW, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        y = g.op("DFT", x_c, axis_i=3, onesided_i=1)
+        y = g.op("Div", y, g.op("Sqrt", Wf))
+        y = g.op("DFT", y, axis_i=2, onesided_i=0)
+        y = g.op("Div", y, g.op("Sqrt", Hf))
+        return y
+
+
+class CustomIRFFT2(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_ri: torch.Tensor):
+        x_c = torch.view_as_complex(x_ri)
+        return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")
+
+    @staticmethod
+    def symbolic(g, x: torch.Value):
+        shp = g.op("Shape", x)
+        iH = g.op("Constant", value_t=torch.tensor([2], dtype=torch.int64))
+        iWr = g.op("Constant", value_t=torch.tensor([3], dtype=torch.int64))
+        nH = g.op("Gather", shp, iH, axis_i=0)
+        nWr = g.op("Gather", shp, iWr, axis_i=0)
+        one = g.op("Constant", value_t=torch.tensor(1, dtype=torch.int64))
+        two = g.op("Constant", value_t=torch.tensor(2, dtype=torch.int64))
+        nW = g.op("Mul", g.op("Sub", nWr, one), two)
+        Hf = g.op("Cast", nH, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        Wf = g.op("Cast", nW, to_i=torch.onnx.TensorProtoDataType.FLOAT)
+        yH = g.op("DFT", x, axis_i=2, inverse_i=1, onesided_i=0)
+        yH = g.op("Mul", yH, g.op("Sqrt", Hf))
+        start = g.op("Sub", nWr, two)  # Wr-2
+        start = g.op(
+            "Squeeze",
+            start,
+            g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64)),
+        )
+        limit = g.op("Constant", value_t=torch.tensor(0, dtype=torch.int64))
+        step = g.op("Constant", value_t=torch.tensor(-1, dtype=torch.int64))
+        idx_r = g.op("Range", start, limit, step)
+        mirW = g.op("Gather", yH, idx_r, axis_i=3)
+        maskW = g.op("Constant", value_t=torch.tensor([1.0, -1.0], dtype=torch.float32))
+        maskW = g.op(
+            "Unsqueeze",
+            maskW,
+            g.op("Constant", value_t=torch.tensor([0, 1, 2, 3], dtype=torch.int64)),
+        )
+        mirWc = g.op("Mul", mirW, maskW)
+        x_full = g.op("Concat", yH, mirWc, axis_i=3)
+        y = g.op("DFT", x_full, axis_i=3, inverse_i=1, onesided_i=0)
+        y = g.op("Mul", y, g.op("Sqrt", Wf))
+        s0 = g.op("Constant", value_t=torch.tensor([0], dtype=torch.int64))
+        s1 = g.op("Constant", value_t=torch.tensor([1], dtype=torch.int64))
+        axC = g.op("Constant", value_t=torch.tensor([4], dtype=torch.int64))
+        y = g.op("Slice", y, s0, s1, axC)
+        y = g.op("Squeeze", y, axC)
+        return y
+
+
+class CustomRfft2Wrap(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        if self.training:
+            y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
+            return torch.view_as_real(y)
+        else:
+            return CustomRFFT2().apply(x)
+
+
+class CustomIrfft2Wrap(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        if self.training:
+            x_c = torch.view_as_complex(x)  # [B,C,H,Wr]
+            return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")  # [B,C,H,W]
+        else:
+            return CustomIRFFT2().apply(x)
+
+
+class FourierUnit(nn.Module):
+    def __init__(self, in_channels, out_channels) -> None:
+        super().__init__()
+        self.rn = RMSNorm(out_channels * 2)
+        self.post_norm = RMSNorm(out_channels)
+
+        self.fdc = nn.Conv2d(
+            in_channels=in_channels * 2,
+            out_channels=out_channels * 2,
+            kernel_size=1,
+            bias=True,
+        )
+
+        self.fpe = nn.Conv2d(
+            in_channels=in_channels * 2,
+            out_channels=in_channels * 2,
+            kernel_size=3,
+            padding=1,
+            groups=in_channels * 2,
+            bias=True,
+        )
+        self.gelu = nn.GELU()
+        self.irfft2 = CustomIrfft2Wrap()
+        self.rfft2 = CustomRfft2Wrap()
+
+    def forward(self, x):
+        # x = self.post_norm(x)
+        orig_dtype = x.dtype
+        x = x.to(torch.float32)
+        b, c, h, w = x.shape
+        ffted = self.rfft2(x)
+        ffted = ffted.permute(0, 4, 1, 2, 3).contiguous()
+        ffted = ffted.view(b, c * 2, h, -1).to(orig_dtype)
+        ffted = self.rn(ffted)
+        ffted = self.fpe(ffted) + ffted
+        ffted = self.fdc(ffted)
+        ffted = self.gelu(ffted)
+        ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous().float()
+        out = self.irfft2(ffted)
+        out = self.post_norm(out.to(orig_dtype))
+        return out
+
+
+class InceptionDWConv2d(nn.Module):
+    """Inception depthwise convolution"""
+
+    def __init__(
+        self,
+        fu_dim,
+        gc,
+        square_kernel_size=13,
+        band_kernel_size=17,
+    ) -> None:
+        super().__init__()
+
+        self.fu = FourierUnit(fu_dim, fu_dim)
+        self.convhw = nn.Conv2d(gc,gc,square_kernel_size,padding=square_kernel_size // 2)
+        self.convw = nn.Conv2d(
+                gc,
+                gc,
+                kernel_size=(1, band_kernel_size),
+                padding=(0, band_kernel_size // 2),
+
+            )
+        self.convh = nn.Conv2d(
+                gc,
+                gc,
+                kernel_size=(band_kernel_size, 1),
+                padding=(band_kernel_size // 2, 0),
+            )
+    def forward(self, x, x_hw, x_w, xh):
+        return self.fu(x),self.convhw(x_hw),self.convw(x_w),self.convh(xh)
 
 
 class GatedCNNBlock(nn.Module):
-    r"""
-    modernized mambaout main unit
-    https://github.com/yuweihao/MambaOut/blob/main/models/mambaout.py#L119
-    """
-
     def __init__(
-        self,
-        dim: int = 64,
-        expansion_ratio: float = 8 / 3,
-        square_kernel_size: int = 11,
-        band_kernel_size: int = 17,
-        rep: bool = False,
+        self, dim: int = 64, expansion_ratio: float = 8 / 3, gc=8
     ) -> None:
         super().__init__()
-        hidden = int(expansion_ratio * dim)
+        hidden = int(expansion_ratio * dim)//8*8
+        self.gamma = nn.Parameter(torch.ones([1, dim, 1, 1]), requires_grad=True)
         self.norm = RMSNorm(dim)
-        self.fc1 = (
-            ConvNXC(dim, hidden * 2, (3, 3))
-            if rep
-            else nn.Conv2d(dim, hidden * 2, 3, 1, 1)
-        )
-        cd = int(dim)
+        self.fc1 = nn.Conv2d(dim, hidden * 2, 3, 1, 1)
         self.act = nn.SiLU()
-        self.split_indices = [hidden, hidden - cd, cd]
-        self.conv = InceptionConv2d(cd, square_kernel_size, band_kernel_size, rep=rep)
-        self.fc2 = (
-            ConvNXC(hidden, dim, (1, 1)) if rep else nn.Conv2d(hidden, dim, 1, 1, 0)
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        shortcut = x
+        self.split_indices = [hidden, hidden - dim, dim-gc*3,gc,gc,gc]
+        self.conv = InceptionDWConv2d(dim-gc*3,gc)
+        self.fc2 = nn.Conv2d(hidden, dim, 3, 1, 1)
+    def feed(self,x):
         x = self.norm(x)
-        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=1)
-        c = self.conv(c)
-        x = self.fc2(self.act(g) * torch.cat((i, c), dim=1))
-        return x + shortcut
+        x = self.fc1(x)
+        g, i, c, c_hw, c_w, c_h = torch.split(x, self.split_indices, dim=1)
+        c, c_hw, c_w, c_h = self.conv(c, c_hw, c_w, c_h)
+        x = self.fc2(self.act(g) * torch.cat((i, c, c_hw, c_w, c_h), dim=1))
+        return x
+    def forward(self, x):
+        return self.feed(x) + x
+
 
 
 @ARCH_REGISTRY.register()
-class GILSR(nn.Module):
+class GFISRV2(nn.Module):
     def __init__(
         self,
-        in_ch: int = 3,
-        scale: int = 4,
-        dim: int = 48,
-        rep: bool = True,
-        expansion_ratios: Sequence[float] = (8 / 3, 8 / 3, 8 / 3, 8 / 3, 8 / 3, 8 / 3),
-        square_kernel_size: int = 11,
-        band_kernel_size: int = 17,
+        in_nc=3,
+        dim=48,
+        expansion_ratio=8 / 3,
+        scale=4,
+        out_nc=3,
+        upsampler: SampleMods = "pixelshuffledirect",
+        mid_dim=32,
+        pixel_unshuffle=True,
+        n_blocks=24,
+        gc = 8,
         **kwargs,
     ) -> None:
         super().__init__()
-
-        self.in_to_dim = (
-            ConvNXC(in_ch, dim, (3, 3)) if rep else nn.Conv2d(in_ch, dim, 3, 1, 1)
-        )
-        self.block_0 = GatedCNNBlock(
-            dim, expansion_ratios[0], square_kernel_size, band_kernel_size, rep=rep
-        )
-        self.block_n = nn.Sequential(
+        if pixel_unshuffle and scale in [1, 2]:
+            down = 4 // scale
+            self.in_to_dim = nn.Sequential(
+                nn.PixelUnshuffle(down), nn.Conv2d(in_nc * down * down, dim, 3, 1, 1)
+            )
+            scale = 4
+            self.pad = down * 2
+        else:
+            self.in_to_dim = nn.Conv2d(in_nc, dim, 3, 1, 1)
+            self.pad = 2
+        self.gfisr_body_half = nn.Sequential(
             *[
-                GatedCNNBlock(dim, er, square_kernel_size, band_kernel_size, rep=rep)
-                for er in expansion_ratios[1:]
+                GatedCNNBlock(dim, expansion_ratio=expansion_ratio, gc=gc)
+                for i in range(n_blocks//2)
             ]
-            + [ConvNXC(dim, dim, (3, 3)) if rep else nn.Conv2d(dim, dim, 3, 1, 1)]
         )
-        self.conv_cat = (
-            ConvNXC(dim * 3, dim, (1, 1)) if rep else nn.Conv2d(dim * 3, dim, 1)
+        self.gfisr_body_half_2 = nn.Sequential(
+            *[
+                GatedCNNBlock(dim, expansion_ratio=expansion_ratio, gc=gc)
+                for i in range(n_blocks-n_blocks // 2)
+            ]+[nn.Conv2d(dim,dim,3,1,1)]
         )
-        self.dim_to_scale = nn.Sequential(
-            nn.Conv2d(dim, in_ch * scale * scale, 3, 1, 1), nn.PixelShuffle(scale)
+        self.cat_to_dim = nn.Conv2d(dim*3,dim,1)
+        self.upscale = UniUpsampleV3(
+            upsampler, scale, dim, out_nc, mid_dim, dysample_end_kernel=3
         )
+        if upsampler == "pixelshuffledirect":
+            weight = ICNR(
+                self.upscale[0].weight,
+                initializer=nn.init.kaiming_normal_,
+                upscale_factor=scale,
+            )
+            self.upscale[0].weight.data.copy_(weight)
 
-        weight = ICNR(
-            self.dim_to_scale[0].weight,
-            initializer=nn.init.kaiming_normal_,
-            upscale_factor=scale,
-        )
-        self.dim_to_scale[0].weight.data.copy_(weight)  # initialize conv.weight
-
+        self.scale = scale
         self.shift = nn.Parameter(torch.ones(1, 3, 1, 1) * 0.5, requires_grad=True)
         self.scale_norm = nn.Parameter(torch.ones(1, 3, 1, 1) / 6, requires_grad=True)
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        state_dict["upscale.MetaUpsample"] = self.upscale.MetaUpsample
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x = x.sub_(self.shift).div_(self.scale_norm)
+    def forward(self, x):
+        x = (x-self.shift)/self.scale_norm
+        B, C, H, W = x.shape
+        mod_pad_h = (self.pad - H % self.pad) % self.pad
+        mod_pad_w = (self.pad - W % self.pad) % self.pad
+
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
+
         x = self.in_to_dim(x)
-        x0 = self.block_0(x)
-        x = self.conv_cat(torch.cat([x, self.block_n(x0), x0], dim=1))
-        x = self.dim_to_scale(x)
-        x = x.mul_(self.scale_norm).add_(self.shift)
-        return x
-
-
-@ARCH_REGISTRY.register()
-def GILSR_s(
-    expansion_ratios: Sequence[float] = (2, 1.25, 1.25, 1.25, 1.25, 2),
-    square_kernel_size: int = 11,
-    band_kernel_size: int = 17,
-    **kwargs,
-):
-    return GILSR(
-        expansion_ratios=expansion_ratios,
-        square_kernel_size=square_kernel_size,
-        band_kernel_size=band_kernel_size,
-        **kwargs,
-    )
-
+        x0 = self.gfisr_body_half(x)
+        x1 = self.gfisr_body_half_2(x0)
+        x = self.cat_to_dim(torch.cat([x1,x, x0], dim=1))
+        x = self.upscale(x)[:, :, : H * self.scale, : W * self.scale]
+        return (x * self.scale_norm) + self.shift
 
 if __name__ == "__main__":
     import time
-
     import torch
+    import os
+
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
 
     def benchmark_model(
-        model, input_size=(1, 3, 256, 256), device=None, runs=50, warmup=10
+        model, input_size=(1, 3, 256, 256), device=None, runs=25, warmup=10
     ):
         """
-        Валидно измеряет скорость инференса и считает параметры модели.
-
-        :param model: torch.nn.Module
-        :param input_size: tuple, размер входного тензора (N, C, H, W)
-        :param device: 'cuda' или 'cpu'. Если None — выбирается автоматически
-        :param runs: количество замеров скорости
-        :param warmup: количество прогревочных прогонов (не учитываются в замере)
-        :return: словарь с метриками
+        Валидно измеряет скорость инференса, параметры и потребление памяти.
         """
 
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        model = model.to(device).eval()
-
-        # Считаем параметры
+        model = model.to(device, memory_format=torch.preserve_format,
+            non_blocking=True,).eval()
+        # torch.preserve_format,
+        # Параметры
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        dummy_input = torch.randn(input_size, device=device)
+        dummy_input = torch.randn(input_size, device=device).to(device, memory_format=torch.preserve_format,
+            non_blocking=True,)
 
-        # Прогрев (важно для CUDA и TorchInductor)
-        with torch.no_grad():
-            for _ in range(warmup):
-                _ = model(dummy_input)
+        # --- Прогрев ---
+        with torch.autocast("cuda", torch.half):
+            with torch.no_grad():
+                for _ in range(warmup):
+                    _ = model(dummy_input)
 
         if device == "cuda":
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
 
-        # Замер времени
+        # CPU memory baseline
+        if device == "cpu" and psutil is not None:
+            process = psutil.Process(os.getpid())
+            mem_before = process.memory_info().rss
+
+        # --- Замер времени ---
         start_time = time.perf_counter()
-
-        with torch.no_grad():
-            for _ in range(runs):
-                _ = model(dummy_input)
+        with torch.autocast("cuda",torch.half):
+            with torch.no_grad():
+                for _ in range(runs):
+                    _ = model(dummy_input)
 
         if device == "cuda":
             torch.cuda.synchronize()
@@ -472,6 +790,21 @@ if __name__ == "__main__":
         avg_time = total_time / runs
         fps = 1.0 / avg_time
 
+        # --- Память ---
+        memory_stats = {}
+
+        if device == "cuda":
+            memory_stats["cuda_max_allocated_mb"] = (
+                torch.cuda.max_memory_allocated() / 1024**2
+            )
+            memory_stats["cuda_max_reserved_mb"] = (
+                torch.cuda.max_memory_reserved() / 1024**2
+            )
+
+        elif device == "cpu" and psutil is not None:
+            mem_after = process.memory_info().rss
+            memory_stats["cpu_rss_mb"] = (mem_after - mem_before) / 1024**2
+
         return {
             "device": device,
             "input_size": input_size,
@@ -479,8 +812,9 @@ if __name__ == "__main__":
             "trainable_params": trainable_params,
             "avg_inference_time_sec": avg_time,
             "fps": fps,
+            **memory_stats,
         }
 
-    stats = benchmark_model(GILSR_s(), input_size=(1, 3, 2048, 2048))
+    stats = benchmark_model(GFISRV2(), input_size=(1, 3, 2601, 1732))
     for k, v in stats.items():
         print(f"{k}: {v}")
